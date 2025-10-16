@@ -92,5 +92,5 @@ test1:
   # stage: build
   script:
     - echo "执行 test1 任务"
-  rules:
-      when: always
+  # rules:
+  #     when: always
