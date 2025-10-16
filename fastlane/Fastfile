@@ -1,0 +1,516 @@
+# This file contains the fastlane.tools configuration
+# You can find the documentation at https://docs.fastlane.tools
+#
+# For a list of all available actions, check out
+#
+#     https://docs.fastlane.tools/actions
+#
+# For a list of all available plugins, check out
+#
+#     https://docs.fastlane.tools/plugins/available-plugins
+#
+
+# Uncomment the line if you want fastlane to automatically update itself
+# update_fastlane
+
+# 环境变量
+require 'dotenv'
+Dotenv.load
+# ENV['FASTLANE_PASSWORD'] = "123456"
+# puts ENV['FASTLANE_PASSWORD']
+
+
+# ------------------------------------------------------------------------------
+
+default_platform(:ios)
+
+platform :ios do
+
+  # 异常捕获
+  before_all do
+    UI.message("Fastlane started")
+  end
+  
+  after_all do |lane|
+    UI.success("Fastlane completed successfully for lane: #{lane}")
+  end
+  
+  error do |lane, exception|
+    UI.error("Error in lane: #{lane}")
+    UI.error("Message: #{exception.message}")
+    UI.error("Backtrace: #{exception.backtrace.join("\n")}")
+  
+    # 记录错误日志
+    File.open("fastlane_error.log", "a") do |file|
+      file.puts("[#{Time.now}] Error in lane: #{lane}")
+      file.puts("Message: #{exception.message}")
+      file.puts("Backtrace: #{exception.backtrace.join("\n")}")
+      file.puts("----")
+    end
+  
+    # 发送飞书通知
+    send_feishu_message(
+      title: "#{SCHEME_NAME} 打包失败",
+      message: "Lane: #{lane}, \nError: #{exception.message}"
+    )
+  end
+
+  # 清理旧文件
+  lane :cleanup do
+    UI.message("🧹 Cleaning up old files...")
+    sh "rm -rf ~/Desktop/#{SCHEME_NAME}-IPA"
+    sh "rm -rf moji_log.txt"
+    sh "rm -rf #{SCHEME_NAME}/moji_log.txt"
+    sh "rm -rf #{SCHEME_NAME}/PPAutoPackageScript/moji_log.txt"
+    sh "touch moji_log.txt"
+    UI.success("✅ Cleanup completed.")
+  end
+
+  # 解锁钥匙串
+  lane :my_unlock_keychain do
+    UI.message("🔓 Unlocking keychain...")
+    unlock_keychain(
+      path: "~/Library/Keychains/login.keychain-db",
+      password: "hugecore0726"
+    )
+    # sh "security unlock-keychain -p hugecore0726"
+    UI.success("✅ Keychain unlocked.")
+  end
+
+  # 获取Git变更记录
+  lane :git_log_changes do
+    UI.message("🔓 Git Log Changes...")
+
+    # sh 'git log $(git rev-parse HEAD~1)..$(git rev-parse HEAD)'
+
+    log_changes = changelog_from_git_commits(
+      # between: ["7b092b3", "HEAD"],  # Optional, lets you specify a revision/tag range between which to collect commit info
+      commits_count: 5,
+      pretty: "- (%ae) %s",# Optional, lets you provide a custom format to apply to each commit when generating the changelog text
+      date_format: "short",# Optional, lets you provide an additional date format to dates within the pretty-formatted string
+      match_lightweight_tag: false,  # Optional, lets you ignore lightweight (non-annotated) tags when searching for the last tag
+      merge_commit_filtering: "exclude_merges" # Optional, lets you filter out merge commits
+    )
+
+    send_feishu_message(title: "#{SCHEME_NAME} 变更记录", message: log_changes)
+
+    UI.success("✅ Git Log Changes.")
+  end
+
+  # 安装依赖
+  lane :install_pods do
+    UI.message("📦 Installing Cocoapods dependencies...")
+    cocoapods(
+      repo_update: true,
+      clean_install: true,
+      podfile: "./Podfile"
+    )
+    UI.success("✅ Pods installed.")
+  end
+
+  # 检查关键字
+  lane :check_keywords do
+    check_keyword = "r_todo"
+    UI.message("🔍 Scanning for keyword: #{check_keyword}...")
+    
+    # 获取所有 .m 和 .swift 文件
+    files = Dir["../**/*.{m,swift}"]
+    offending_files = []
+
+    # UI.message("🔍 files: #{files}")
+
+    # 遍历文件查找关键字
+    files.each do |file|
+      if File.read(file).include?(check_keyword)
+        offending_files << file
+        UI.error("❌ Keyword found in: #{file}")
+      end
+    end
+
+    # 如果有违规文件则终止任务
+    if offending_files.any?
+      UI.user_error!("Production environment contains TODOs in the following files:\n#{offending_files.join("\n")}")
+    else
+      UI.success("✅ No TODOs found in production environment.")
+    end
+  end
+
+  # 自动打包
+  lane :build do
+    UI.message("📦 Building the app...")
+    gym(
+      scheme: "#{SCHEME_NAME}",
+      workspace: "#{SCHEME_NAME}.xcworkspace",
+      configuration: "#{CONFIGURATION}",
+      clean: true,
+      export_method: "#{EXPORT_METHOD}", # 根据需求选择 app-store / ad-hoc / enterprise
+      output_directory: "~/Desktop/#{SCHEME_NAME}-IPA",
+      output_name: "#{SCHEME_NAME}.ipa",
+      xcargs: "-allowProvisioningUpdates"
+    )
+    UI.success("✅ Build completed.")
+  end
+
+  # 上传 IPA 和 plist
+  lane :upload_ipa do
+    ipa_path = "~/Desktop/#{SCHEME_NAME}-IPA/#{SCHEME_NAME}.ipa"
+    plist_path = "../../manifest/manifest.plist"
+    sh "cat #{plist_path}"
+    version = get_version_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj", target: "#{SCHEME_NAME}")
+
+    # 更新 plist 文件
+    UI.message("📝 Updating plist file...")
+    ipa_url = "#{IPA_URL_SUFFIX}/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.ipa"
+    plist_data = Plist.parse_xml(plist_path)
+    plist_data['items'][0]['assets'][0]['url'] = ipa_url
+    plist_data['items'][0]['metadata']['bundle-version'] = version
+    File.write(plist_path, plist_data.to_plist)
+    UI.success("✅ Plist file updated.")
+
+    # 上传 IPA 和 plist 到服务器
+    UI.message("🚀 Uploading IPA and plist to server...")
+
+    # 拷贝前先创建路径
+    sh "ssh -p 2023 admin@192.168.1.3 -f 'mkdir -p #{IPA_RELPATH_SUFFIX}/manifest'"
+    sh "scp -P 2023 #{ipa_path} admin@192.168.1.3:#{IPA_RELPATH_SUFFIX}/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.ipa"
+    sh "scp -P 2023 #{plist_path} admin@192.168.1.3:#{IPA_RELPATH_SUFFIX}/manifest/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.plist"
+
+    UI.success("✅ IPA and plist uploaded.")
+    UI.important("Install with Safari: itms-services://?action=download-manifest&url=#{IPA_URL_SUFFIX}/manifest/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.plist")
+  end
+
+  # 备份 archive 文件
+  # lane :backup_archive do
+  #   UI.message("📦 Backing up the archive file...")
+
+  #   archive_path = "../archive/#{SCHEME_NAME}-IPA/#{SCHEME_NAME}.xcarchive"
+  #   zip_path = "../archive/#{SCHEME_NAME}-IPA/#{SCHEME_NAME}.app.dSYM.zip"
+
+  #   version = get_version_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj", target: "#{SCHEME_NAME}")
+  #   build_number = get_build_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj")
+
+  #   # 压缩 archive 文件夹
+  #   sh "cd ../archive/#{SCHEME_NAME}-IPA && zip -r #{SCHEME_NAME}.app.dSYM.zip #{SCHEME_NAME}.xcarchive/dSYMs/#{SCHEME_NAME}.app.dSYM"
+
+  #   # 上传 zip 文件到服务器
+  #   UI.message("🚀 Uploading archive zip to server...")
+
+  #   # 拷贝前先创建路径
+  #   sh "ssh -p 2023 admin@192.168.1.3 -f 'mkdir -p #{IPA_RELPATH_SUFFIX}/archive'"
+  #   sh "scp -P 2023 #{zip_path} admin@192.168.1.3:#{IPA_RELPATH_SUFFIX}/archive/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.zip"
+
+  #   send_feishu_message(
+  #     title: "#{SCHEME_NAME} 归档备份成功",
+  #     message: "版本号: #{version}, \nBuild版本号: #{build_number}, \n下载地址：#{IPA_URL_SUFFIX}/archive/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.zip"
+  #   )
+
+  #   UI.success("✅ Archive zip uploaded.")
+  #   UI.important("Download archive zip: #{IPA_URL_SUFFIX}/archive/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.zip")
+  # end
+
+  # 生成下载链接
+  lane :generate_download_link do
+    UI.message("🌐 时间戳:#{TIMESTAMP}")
+    
+    version = get_version_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj", target: "#{SCHEME_NAME}")
+    download_url = "#{IPA_URL_SUFFIX}/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.ipa"
+    manifest_url = "itms-services://?action=download-manifest&url=#{IPA_URL_SUFFIX}/manifest/#{SCHEME_NAME}_#{version}_#{TIMESTAMP}.plist"
+
+    UI.message("🌐 Download link generated:")
+    UI.important(download_url)
+
+    send_feishu_message_ipa(
+      title: "#{SCHEME_NAME} #{CONFIGURATION}包",
+      branch: "#{COMMIT_BRANCH}",
+      download_text: "提测包下载",
+      download_link: download_url,
+      manifest_text: "Safari安装(复制完整地址到Safari打开)",
+      manifest_link: manifest_url
+    )
+  end
+
+  # 上传TF
+  lane :upload_ipa_to_testflight do
+    UI.message("🚀 开始上传TF包...")
+
+    # 存储到内存中可通过上下文读取：lane_context[SharedValues::APP_STORE_CONNECT_API_KEY]
+    app_store_connect_api_key(
+      key_id: "Q2LWSVJK3N",
+      issuer_id: "743641a2-b6b4-4169-8b12-6887be28d044",
+      key_filepath: "../CICD/AppStoreConnectAPI-GitAuto-AuthKey_Q2LWSVJK3N.p8"
+    )
+
+    # apikey = lane_context[SharedValues::APP_STORE_CONNECT_API_KEY]
+    # UI.message("apikey为：\n #{apikey[:issuer_id]}")
+    
+    ipa_path = "~/Desktop/#{SCHEME_NAME}-IPA/#{SCHEME_NAME}.ipa"
+    upload_to_testflight(
+      ipa: ipa_path,
+      skip_waiting_for_build_processing: true, # 跳过等待构建过程
+      skip_submission: true # 只上传不提交审核
+    )
+
+    # 成功发送飞书通知
+    version = get_version_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj", target: "#{SCHEME_NAME}")
+    build_number = get_build_number(xcodeproj: "#{SCHEME_NAME}.xcodeproj")
+
+    send_feishu_message(
+      title: "#{SCHEME_NAME} TF上传成功",
+      message: "版本号: #{version}, \nBuild版本号: #{build_number}"
+    )
+
+    UI.success("✅ 上传TF成功")
+  end
+
+
+  # 发送飞书打包通知
+  # 命令行测试
+  # fastlane send_feishu_message_ipa title:"KoriDict 测试包" branch:"dev" download_text:"测试包下载" download_link:"#{download_url}" manifest_text:"Safari地址" manifest_link:"#{download_url}"
+  lane :send_feishu_message_ipa do |options|
+    require 'json'
+    require 'net/http'
+    require 'uri'
+
+    # 获取参数
+    title = options[:title] || "#{SCHEME_NAME} 提测包"
+    branch = options[:branch] || "dev"
+    download_text = options[:download_text] || "#{SCHEME_NAME}"
+    download_link = options[:download_link] || "http://www.example.com/"
+    manifest_text = options[:manifest_text] || "Safari地址"
+    manifest_link = options[:manifest_link] || "http://www.example.com/"
+
+    # 组织消息内容
+    message_content = {
+      "msg_type" => "post",
+      "content" => {
+        "post" => {
+          "zh_cn" => {
+            "title" => title,
+            "content" => [
+              [
+                { "tag" => "text", "text" => "打包分支：#{branch}" },
+                { "tag" => "text", "text" => "\n下载地址: " },
+                { "tag" => "a", "text" => download_text, "href" => download_link },
+                { "tag" => "text", "text" => "\n#{manifest_text}: \n#{manifest_link}" }
+                # { "tag" => "a", "text" => manifest_text, "href" => manifest_link }
+              ]
+            ]
+          }
+        }
+      }
+    }.to_json
+
+    # 使用 curl 命令发送请求(如果data包含单引号会导致发生请求失败)
+
+    # sh "curl --location '#{FEISHU_WEBHOOK}' " \
+    #   "--header 'Content-Type: application/json' " \
+    #   "--data '#{message_content}'"
+
+    uri = URI.parse(FEISHU_WEBHOOK)
+    request = Net::HTTP::Post.new(uri)
+    request.content_type = "application/json"
+    request.body = message_content
+
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+      http.request(request)
+    end
+
+  end
+
+  # 发送飞书通用通知
+  # fastlane send_feishu_message title:"KoriDict 测试包" message:"-"
+  lane :send_feishu_message do |options|
+    require 'json'
+    require 'net/http'
+    require 'uri'
+
+    # 获取参数
+    title = options[:title] || "#{SCHEME_NAME} 打包提示"
+    message = options[:message] || " "
+
+    # 组织消息内容
+    message_content = {
+      "msg_type" => "post",
+      "content" => {
+        "post" => {
+          "zh_cn" => {
+            "title" => title,
+            "content" => [
+              [
+                { "tag" => "text", "text" => message }
+              ]
+            ]
+          }
+        }
+      }
+    }.to_json
+
+    # 使用 curl 命令发送请求
+
+    # sh "curl --location '#{FEISHU_WEBHOOK}' " \
+    #   "--header 'Content-Type: application/json' " \
+    #   "--data '#{message_content}'"
+
+    # 发送飞书通知
+    uri = URI.parse(FEISHU_WEBHOOK)
+    request = Net::HTTP::Post.new(uri)
+    request.content_type = "application/json"
+    request.body = message_content
+
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+      http.request(request)
+    end
+
+  end
+
+  # 打测试包
+  lane :build_debug do
+    # 流程开始
+    # check_keywords
+    my_unlock_keychain
+    cleanup
+    install_pods
+    build
+    upload_ipa
+    generate_download_link
+    git_log_changes
+  end
+
+  # 打生产包
+  lane :build_release do
+    build_debug
+  end
+
+  # 打发布上架包
+  lane :build_appstore do |options|
+    # 流程开始
+    check_keywords
+    my_unlock_keychain
+    cleanup
+
+    # 自动增加版本号
+    build_version = options[:build_version]
+    UI.message("📦 build版本号自增：#{build_version}")
+    
+    increment_build_number({
+      build_number: build_version
+    })
+
+    install_pods
+    build
+    # upload_ipa
+    # generate_download_link
+    upload_ipa_to_testflight
+    git_log_changes
+    # backup_archive
+  end
+
+  # 整体流程
+  lane :build_and_deploy do |options|
+    UI.message("📦 Building the build_and_deploy...")
+
+    # debug, release, appstore
+    type_build = options[:type_build] || "appstore"
+    
+    # 设置全局变量
+
+    SCHEME_NAME = "KoriDict"
+    # IPA包下载地址前缀
+    IPA_URL_SUFFIX = "https://gzoffice.mojidict.com:9000/iOS/koridict"
+    # IPA包物理地址
+    IPA_RELPATH_SUFFIX = "/home/admin/file-server-static/iOS/koridict"
+    # 时间戳提取：命名IPA包需要
+    TIMESTAMP = Time.now.strftime("%Y-%m-%d-%H-%M-%S")
+
+    # 飞书 Webhook URL
+    # ios 打包群
+    FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/b578e28c-fde5-42bd-8ef5-9621f435094b"
+    # 调试打包群
+    # FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/ccf6db93-3020-4ba6-aa35-ca407aea4fc3"
+ 
+    CONFIGURATION = "Debug" # Debug, Release
+    EXPORT_METHOD = "development" # app-store, ad-hoc, development
+    COMMIT_BRANCH = 'dev'
+
+    # 读取传入的参数 `type_build`
+    type_build = options[:type_build]
+
+    UI.message("开始打包, 构建类型: #{type_build}")
+
+    # 根据 `type_build` 参数值执行不同逻辑
+    case type_build
+    when "debug"
+      UI.message("执行 Debug 构建逻辑")
+
+      CONFIGURATION = "Debug" 
+      EXPORT_METHOD = "development"
+      COMMIT_BRANCH = 'dev'
+
+      build_debug
+    when "release"
+      UI.message("执行 Release 构建逻辑")
+
+      CONFIGURATION = "Release"
+      EXPORT_METHOD = "ad-hoc"
+      COMMIT_BRANCH = 'master'
+
+      build_release
+    when "appstore"
+      UI.message("执行 App Store 构建逻辑")
+
+      CONFIGURATION = "Release"
+      EXPORT_METHOD = "app-store"
+      COMMIT_BRANCH = 'master'
+
+      build_date = options[:build_date]
+      unless build_date&.match(/^\d{8}$/)
+        UI.user_error!("❌ build版本号格式错误，正确格式为8位年月日数字，如：20241226")
+      end
+      # 上传到 TestFlight 或 App Store
+      build_appstore(build_version: build_date)
+    else
+      UI.error("未识别的构建类型: #{type_build}")
+      UI.user_error!("请提供有效的 type_build 参数: debug, release, appstore")
+    end
+
+    UI.message("CONFIGURATION：#{CONFIGURATION} EXPORT_METHOD：#{EXPORT_METHOD}")
+
+    # sh("some_command_that_might_fail") # 模拟出错的命令
+
+    UI.success("🎉 Build and deployment completed: #{type_build}")
+  end
+
+  lane :test do
+    UI.message("执行测试逻辑")
+  end
+
+end
+
+
+
+# 测试飞书通知
+
+# curl --location 'https://open.feishu.cn/open-apis/bot/v2/hook/ccf6db93-3020-4ba6-aa35-ca407aea4fc3' \
+# --header 'Content-Type: application/json' \
+# --data '{
+#     "msg_type": "post",
+#     "content": {
+#         "post": {
+#             "zh_cn": {
+#                 "title": "KoriDict提测包",
+#                 "content": [
+#                     [
+#                         {
+#                             "tag": "text",
+#                             "text": "打包分支：dev"
+#                         },
+#                         {
+#                             "tag": "text",
+#                             "text": "\n下载地址: \nhttps://open.feishu.cn/open-apis/bot/v2/hook/ccf6db93-3020-4ba6-aa35-ca407aea4fc3"
+#                         }
+#                     ]
+#                 ]
+#             }
+#         }
+#     }
+# }'
