@@ -1,0 +1,96 @@
+variables:
+  # V1: "test v1"
+  # CI_DEBUG_TRACE: "true"
+
+default:
+  tags:
+    # - ios_runner # 指定当前使用的runner(GitLab上配置的)
+    - macos # 指定当前使用的runner(GitLab上配置的)
+
+before_script:
+  - echo "**** before_script 开始 ****"
+  - export LANG=en_US.UTF-8
+  - export LANGUAGE=en_US.UTF-8
+  - export LC_ALL=en_US.UTF-8
+
+  - cd KoriDict
+
+  # 确保 Ruby 环境正确
+  - ruby -v
+  - gem -v
+  # - gitlab-runner -v
+  # 安装或更新 bundler
+  # - gem install bundler
+  - rm -rf Gemfile.lock
+  - rm -rf Podfile.lock
+  - bundle install --verbose
+  - pwd
+  - echo "**** before_script 结束 ****"
+
+stages:
+  - build
+  - release
+
+# 手动触发的构建任务
+build_manual:
+  stage: build
+  script:
+    - echo "开始手动触发构建任务"
+    - echo "release=${release}"
+    - |
+      if [ "$release" == "1" ]; then
+        echo "执行 release 构建"
+        bundle exec fastlane build_and_deploy type_build:release --verbose
+      else
+        echo "执行 debug 构建"
+        bundle exec fastlane test --verbose
+      fi
+    - echo "构建任务完成"
+  rules:
+    - if: $release
+      when: always
+
+# 自动触发的分支构建保持不变
+dev_build:
+  stage: build
+  script:
+    - echo "开始 dev 分支打包"
+    # - bundle exec fastlane build_and_deploy type_build:debug --verbose
+    - bundle exec fastlane test --verbose
+    - echo "dev 分支打包完成"
+  rules:
+    - if: $BUILD_TYPE
+      when: never
+    - if: $CI_COMMIT_BRANCH == "dev"
+      when: always
+
+# master 分支的自动打包
+master_build:
+  stage: build
+  script:
+    - echo "开始 master 分支打包"
+    - bundle exec fastlane build_and_deploy type_build:release --verbose
+    - echo "master 分支打包完成"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master1" 
+
+# master 分支打 tag 自动触发上传操作
+master_tag_build:
+  stage: release
+  script:
+    - echo "开始 master 分支 tag 打包上传操作"
+    - echo "Tag：$CI_COMMIT_TAG"
+    - BUILD_DATE=${CI_COMMIT_TAG#*build_} # 提取日期部分
+    - BUILD_DATE=${BUILD_DATE%%_*}
+    - echo "提前到build版本号为：$BUILD_DATE"
+    - bundle exec fastlane build_and_deploy type_build:appstore build_date:$BUILD_DATE --verbose
+    - echo "master 分支 tag 打包上传完成"
+  rules:
+    - if: $CI_COMMIT_TAG # 检查tag 不区分分支
+
+test1:
+  # stage: build
+  script:
+    - echo "执行 test1 任务"
+  rules:
+      when: always
